@@ -33,6 +33,10 @@ def parse_args():
                         help='Disable action smoothing')
     parser.add_argument('--smooth_window', type=int, default=3,
                         help='Minimum steps between lane changes')
+    parser.add_argument('--lanes', type=int, default=3,
+                        help='Number of highway lanes')
+    parser.add_argument('--density', type=float, default=1.0,
+                        help='Traffic density (vehicles_density)')
     return parser.parse_args()
 
 
@@ -137,7 +141,8 @@ def evaluate(args):
     # Environment config
     env_config = {
         'action': {'type': 'DiscreteMetaAction'},
-        'lanes_count': 3,
+        'lanes_count': args.lanes,
+        'vehicles_density': args.density,
         'ego_spacing': 1.5,
     }
     
