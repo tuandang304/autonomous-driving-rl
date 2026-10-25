@@ -13,6 +13,7 @@ import argparse
 from tqdm import tqdm
 
 from src.utils import set_seed
+from src.env.endless_highway import make_long_episode
 from src.agents import DQNAgent, DoubleDQNAgent, DuelingDQNAgent, D3QNAgent, PPOAgent
 
 
@@ -37,6 +38,8 @@ def parse_args():
                         help='Number of highway lanes')
     parser.add_argument('--density', type=float, default=1.0,
                         help='Traffic density (vehicles_density)')
+    parser.add_argument('--duration', type=float, default=40,
+                        help='Episode duration in seconds (>40 enables the endless highway)')
     return parser.parse_args()
 
 
@@ -143,11 +146,12 @@ def evaluate(args):
         'action': {'type': 'DiscreteMetaAction'},
         'lanes_count': args.lanes,
         'vehicles_density': args.density,
+        'duration': args.duration,
         'ego_spacing': 1.5,
     }
     
     render_mode = None if args.no_render else 'human'
-    env = gymnasium.make("highway-v0", config=env_config, render_mode=render_mode)
+    env = make_long_episode(gymnasium.make("highway-v0", config=env_config, render_mode=render_mode), args.duration)
     
     state_dim = env.observation_space.shape[0] * env.observation_space.shape[1]
     action_dim = env.action_space.n

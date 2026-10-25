@@ -35,12 +35,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from evaluate import ActionSmoother, load_agent  # noqa: E402
+from src.env.endless_highway import make_long_episode  # noqa: E402
 from src.utils import set_seed  # noqa: E402
 
 
 ACTION_LABELS = ("LANE LEFT", "IDLE", "LANE RIGHT", "FASTER", "SLOWER")
 ALGO_LABELS = {"dqn": "DQN", "double_dqn": "DOUBLE DQN", "dueling_dqn": "DUELING DQN",
-               "d3qn": "D3QN", "ppo": "PPO"}
+               "d3qn": "D3QN", "ppo": "PPO", "rule_based": "RULE-BASED"}
 CAR_KINDS = ("sedan", "hatch", "van", "pickup")
 TRAFFIC_COLORS = [(214, 58, 58), (38, 104, 196), (236, 236, 232), (34, 36, 42), (150, 156, 168),
                   (246, 186, 48), (58, 150, 92), (122, 72, 168), (204, 112, 44), (90, 180, 210)]
@@ -77,12 +78,14 @@ def parse_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--algorithm', type=str, default='dueling_dqn',
-                        choices=['dqn', 'double_dqn', 'dueling_dqn', 'd3qn', 'ppo'])
+                        choices=['dqn', 'double_dqn', 'dueling_dqn', 'd3qn', 'ppo', 'rule_based'])
     parser.add_argument('--weights', type=str, default='weights/best_model.pth')
     parser.add_argument('--episodes', type=int, default=3)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--lanes', type=int, default=3, help='Number of highway lanes')
     parser.add_argument('--density', type=float, default=1.0, help='Traffic density (vehicles_density)')
+    parser.add_argument('--duration', type=float, default=1000,
+                        help='Episode duration in seconds (>40 enables the endless highway)')
     parser.add_argument('--no_smooth', action='store_true', help='Disable action smoothing')
     parser.add_argument('--smooth_window', type=int, default=3, help='Minimum steps between lane changes')
     parser.add_argument('--theme', type=str, default='night', choices=list(THEMES))
@@ -553,8 +556,9 @@ class GameRenderer:
         while self.anim_t < t_end and not self.request:
             self.frame(1.0)
 
-    def set_decision(self, q, raw_action, final_action):
+    def set_decision(self, q, raw_action, final_action, reason=None):
         self.q, self.raw_action, self.final_action = q, int(raw_action), int(final_action)
+        self.reason = reason
 
     def on_substep(self):
         """Called after every simulation substep; renders interpolated frames."""
@@ -713,6 +717,8 @@ class GameRenderer:
         out = {}
         for vid, c in self.curr.items():
             p = self.prev.get(vid, c)
+            if abs(c[0] - p[0]) > 50.0:  # recycled by EndlessHighway: jump, don't slide
+                p = c
             dh = (c[2] - p[2] + math.pi) % (2 * math.pi) - math.pi
             out[vid] = (p[0] + (c[0] - p[0]) * a, p[1] + (c[1] - p[1]) * a, p[2] + dh * a,
                         p[3] + (c[3] - p[3]) * a, c[4], c[5], c[6])
@@ -1079,7 +1085,8 @@ class GameRenderer:
     def _decision(self, surf, r):
         T = self.T
         surf.blit(self.text("AI DECISION", 13, T["dim"], bold=True), (r.x, r.y))
-        surf.blit(self.text("Q-VALUES", 11, mix(T["dim"], T["hud_bot"], 0.3), bold=True), (r.x + 108, r.y + 2))
+        subtitle = "Q-VALUES" if self.q is not None else "RULE FIRED"
+        surf.blit(self.text(subtitle, 11, mix(T["dim"], T["hud_bot"], 0.3), bold=True), (r.x + 108, r.y + 2))
         if self.raw_action != self.final_action:
             tag = self.text(f"SMOOTHER  {ACTION_LABELS[self.raw_action]} → {ACTION_LABELS[self.final_action]}", 11, T["warn"], bold=True)
             surf.blit(tag, (r.right - tag.get_width(), r.y + 2))
@@ -1097,13 +1104,14 @@ class GameRenderer:
                 pygame.draw.rect(surf, mix(T["hud_top"], T["accent"], 0.13), (r.x - 6, y - 2, r.w + 8, row_h - 4), border_radius=6)
             draw_action_icon(surf, i, r.x + 12, y + 10, col)
             surf.blit(self.text(name, 13, T["text"] if chosen else T["dim"], bold=chosen), (r.x + 32, y + 2))
-            pygame.draw.rect(surf, T["track_hud"], (bar_x, y + 5, bar_w, 10), border_radius=5)
             if q is not None:
+                pygame.draw.rect(surf, T["track_hud"], (bar_x, y + 5, bar_w, 10), border_radius=5)
                 fw = int(bar_w * (0.05 + 0.95 * float(self.bar_disp[i])))
                 pygame.draw.rect(surf, col if chosen else mix(T["dim"], T["track_hud"], 0.35), (bar_x, y + 5, fw, 10), border_radius=5)
                 surf.blit(self.text(f"{q[i]:7.2f}", 13, T["text"] if chosen else T["dim"], mono=True), (bar_x + bar_w + 8, y + 1))
         if q is None:
-            surf.blit(self.text("(policy network: no Q-values)", 12, T["dim"]), (bar_x, r.y + 2))
+            reason = getattr(self, "reason", None) or "no Q-values for this agent"
+            surf.blit(self.text(reason, 12, T["accent"], bold=True), (bar_x, r.y + 28 + self.final_action * row_h + 2))
 
     def _stats(self, surf, r, st):
         T = self.T
@@ -1213,13 +1221,18 @@ def run(args):
         'action': {'type': 'DiscreteMetaAction'},
         'lanes_count': args.lanes,
         'vehicles_density': args.density,
+        'duration': args.duration,
         'ego_spacing': 1.5,
     }
-    env = gymnasium.make("highway-v0", config=env_config)
+    env = make_long_episode(gymnasium.make("highway-v0", config=env_config), args.duration)
     uenv = env.unwrapped
     state_dim = env.observation_space.shape[0] * env.observation_space.shape[1]
-    agent = load_agent(args.algorithm, state_dim, env.action_space.n, args.weights)
-    smoother = None if args.no_smooth else ActionSmoother(cooldown=args.smooth_window)
+    if args.algorithm == 'rule_based':
+        from baselines.rule_based import RuleBasedPolicy
+        agent, smoother = RuleBasedPolicy(lanes_count=args.lanes), None
+    else:
+        agent = load_agent(args.algorithm, state_dim, env.action_space.n, args.weights)
+        smoother = None if args.no_smooth else ActionSmoother(cooldown=args.smooth_window)
 
     renderer = None
     episode = 1
@@ -1234,13 +1247,15 @@ def run(args):
         renderer.begin_episode(uenv, episode, seed)
         if smoother:
             smoother.reset()
+        if hasattr(agent, "reset"):
+            agent.reset()
 
         done = truncated = False
         episode_return, info = 0.0, {}
         while not (done or truncated) and not renderer.request:
             raw = agent.select_action(state, evaluate=True)
             action = smoother.filter(raw, state) if smoother else raw
-            renderer.set_decision(q_values(agent, state), raw, action)
+            renderer.set_decision(q_values(agent, state), raw, action, getattr(agent, "reason", None))
             state, reward, done, truncated, info = env.step(action)
             state = state.reshape(-1)
             episode_return += reward
